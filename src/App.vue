@@ -7,6 +7,8 @@ import BottomNav, { type TabId } from "./components/BottomNav.vue";
 import KernelDownloadModal, { type KernelState } from "./components/KernelDownloadModal.vue";
 import KernelFailModal from "./components/KernelFailModal.vue";
 import KernelSuccessModal from "./components/KernelSuccessModal.vue";
+import KernelUpdateModal from "./components/KernelUpdateModal.vue";
+import ShellUpdateModal from "./components/ShellUpdateModal.vue";
 import HomeView from "./views/HomeView.vue";
 import LobbyView from "./views/LobbyView.vue";
 import FriendsView from "./views/FriendsView.vue";
@@ -28,11 +30,60 @@ const kernelState = ref<KernelState>("checking");
 const kernelProgress = ref(0);
 const kernelError = ref("");
 
+// ---------- 内核更新检查 ----------
+const kernelUpdate = ref({ show: false, current: "", latest: "" });
+
+// ---------- 外壳更新 ----------
+const shellUpdate = ref({ show: false, current: 0, latest: 0 });
+const shellProgress = ref(0);
+
+async function checkShellUpdate() {
+  try {
+    const info = await invoke<{ available: boolean; current: number; latest: number }>(
+      "check_shell_update"
+    );
+    if (info.available) {
+      shellUpdate.value = { show: true, current: info.current, latest: info.latest };
+    }
+  } catch {
+    // 检查失败不打扰
+  }
+}
+
+async function startShellDownload() {
+  shellProgress.value = 0;
+  try {
+    await invoke("download_shell");
+    // 更新脚本已启动：提示后关闭窗口（bat 负责替换并重启）
+    setTimeout(() => {
+      shellUpdate.value.show = false;
+      appWindow.close();
+    }, 1500);
+  } catch (e) {
+    shellUpdate.value.show = false;
+    console.error("shell update failed:", e);
+  }
+}
+
 async function checkKernel() {
   kernelState.value = "checking";
   try {
     const ok = await invoke<boolean>("check_kernel");
     kernelState.value = ok ? "ready" : "missing";
+    if (ok) {
+      // 内核就绪后检查是否有新版本
+      try {
+        const info = await invoke<{ available: boolean; current: string; latest: string }>(
+          "check_kernel_update"
+        );
+        if (info.available) {
+          kernelUpdate.value = { show: true, current: info.current, latest: info.latest };
+        }
+      } catch {
+        // 更新检查失败不打扰（网络问题等）
+      }
+      checkShellUpdate();
+    }
   } catch (e) {
     kernelError.value = String(e);
     kernelState.value = "error";
@@ -46,19 +97,27 @@ async function startKernelDownload() {
   try {
     await invoke("download_kernel");
     kernelState.value = "ready";
+    kernelUpdate.value.show = false; // 更新完成，关闭更新弹窗
+    checkKernel(); // 重新检查（更新后版本已刷新）
   } catch (e) {
     kernelError.value = String(e);
     kernelState.value = "error";
+    kernelUpdate.value.show = false; // 关闭更新弹窗，让下载失败弹窗可见
   }
 }
 
 let unlistenProgress: UnlistenFn | undefined;
 let unlistenExited: UnlistenFn | undefined;
+let unlistenShellProgress: UnlistenFn | undefined;
 onMounted(() => {
   checkKernel();
   listen<number>("kernel-download-progress", (e) => {
     kernelProgress.value = e.payload;
   }).then((un) => (unlistenProgress = un));
+
+  listen<number>("shell-download-progress", (e) => {
+    shellProgress.value = e.payload;
+  }).then((un) => (unlistenShellProgress = un));
 
   // 内核退出全局监听（App 常驻，切换板块也不会错过）：
   // 主动停止（stop-request）不弹窗；退出码 0 = 正常关闭（隧道被回收/连接断开），
@@ -84,6 +143,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   unlistenProgress?.();
   unlistenExited?.();
+  unlistenShellProgress?.();
 });
 
 // ---------- 启动失败弹窗 ----------
@@ -188,6 +248,26 @@ function onTitlebarMousedown(e: MouseEvent) {
       :server="kernelOpen.server"
       :port="kernelOpen.port"
       @close="kernelOpen.show = false"
+    />
+
+    <!-- 内核新版本提示弹窗 -->
+    <KernelUpdateModal
+      v-if="kernelUpdate.show"
+      :current="kernelUpdate.current"
+      :latest="kernelUpdate.latest"
+      :progress="kernelProgress"
+      @close="kernelUpdate.show = false"
+      @update="startKernelDownload"
+    />
+
+    <!-- 外壳新版本提示弹窗 -->
+    <ShellUpdateModal
+      v-if="shellUpdate.show"
+      :current="shellUpdate.current"
+      :latest="shellUpdate.latest"
+      :progress="shellProgress"
+      @close="shellUpdate.show = false"
+      @update="startShellDownload"
     />
   </div>
 </template>

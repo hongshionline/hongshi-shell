@@ -27,6 +27,251 @@ fn kernel_exe() -> PathBuf {
     kernel_dir().join("hongshi.exe")
 }
 
+/// 内核版本记录文件
+fn kernel_version_file() -> PathBuf {
+    kernel_dir().join("version.txt")
+}
+
+/// 请求 core_version.json（主站 → 镜像），返回版本号字符串
+async fn fetch_core_version() -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("HTTP 客户端初始化失败：{e}"))?;
+    let mut last_err = String::new();
+    for base in ["https://hongshi.site", "https://shithub.site"] {
+        let url = format!("{base}/core_version.json");
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(v) = json.get("version") {
+                            // version 可能是数字 / 字符串 / 语义化版本
+                            if let Some(s) = v.as_str() {
+                                return Ok(s.to_string());
+                            }
+                            if let Some(n) = v.as_i64() {
+                                return Ok(n.to_string());
+                            }
+                        }
+                        last_err = "响应缺少 version 字段".into();
+                    }
+                    Err(e) => last_err = format!("响应解析失败：{e}"),
+                }
+            }
+            Ok(resp) => last_err = format!("HTTP {}", resp.status()),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(format!("版本检查失败（{last_err}）"))
+}
+
+// ---------- 外壳更新 ----------
+
+/// 外壳本地版本号（与服务端 shell_version.json 的数字一致）
+const SHELL_VERSION: i32 = 100;
+
+/// 请求 shell_version.json（主站 → 镜像），返回最新外壳版本号
+async fn fetch_shell_version() -> Result<i32, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .map_err(|e| format!("HTTP 客户端初始化失败：{e}"))?;
+    let mut last_err = String::new();
+    for base in ["https://hongshi.site", "https://shithub.site"] {
+        let url = format!("{base}/shell_version.json");
+        match client.get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(n) = json.get("version").and_then(|v| v.as_i64()) {
+                            return Ok(n as i32);
+                        }
+                        last_err = "响应缺少 version 字段".into();
+                    }
+                    Err(e) => last_err = format!("响应解析失败：{e}"),
+                }
+            }
+            Ok(resp) => last_err = format!("HTTP {}", resp.status()),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(format!("版本检查失败（{last_err}）"))
+}
+
+/// 检查外壳是否有新版本
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ShellUpdateInfo {
+    available: bool,
+    current: i32,
+    latest: i32,
+}
+
+#[tauri::command]
+async fn check_shell_update() -> ShellUpdateInfo {
+    match fetch_shell_version().await {
+        Ok(latest) => ShellUpdateInfo {
+            available: latest != SHELL_VERSION,
+            current: SHELL_VERSION,
+            latest,
+        },
+        Err(_) => ShellUpdateInfo {
+            available: false,
+            current: SHELL_VERSION,
+            latest: SHELL_VERSION,
+        },
+    }
+}
+
+/// 下载外壳新版本并延迟替换：
+/// 1. 请求 /api/download/app 拿签名 URL（主站 → 镜像）
+/// 2. 流式下载到 <exe目录>/app_new.exe（进度事件 shell-download-progress）
+/// 3. 生成 update_shell.bat：延迟 2s 杀掉旧进程 → 替换 → 重启 → 自删
+/// 4. 启动脚本（无窗口）；外壳由前端关闭
+#[tauri::command]
+async fn download_shell(app: tauri::AppHandle) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("HTTP 客户端初始化失败：{e}"))?;
+
+    // 1. 获取签名下载地址
+    let mut last_err = String::new();
+    let mut download_url = None;
+    for base in ["https://hongshi.site", "https://shithub.site"] {
+        let api = format!("{base}/api/download/app");
+        match client.get(&api).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<serde_json::Value>().await {
+                    Ok(json) => {
+                        if let Some(u) = json["url"].as_str() {
+                            download_url = Some(u.to_string());
+                            break;
+                        }
+                        last_err = "响应缺少 url 字段".into();
+                    }
+                    Err(e) => last_err = format!("响应解析失败：{e}"),
+                }
+            }
+            Ok(resp) => {
+                last_err = format!("HTTP {}", resp.status());
+                if resp.status() == 429 {
+                    last_err = "触发限流（60 秒内仅 1 次，每日 5 次），请稍后再试".into();
+                }
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    let url = download_url.ok_or_else(|| format!("获取下载地址失败（{last_err}）"))?;
+
+    // 2. 下载到 exe 同目录
+    let exe_path = std::env::current_exe().map_err(|e| format!("定位外壳失败：{e}"))?;
+    let dir = exe_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .to_path_buf();
+    let new_exe = dir.join("app_new.exe");
+    let exe_name = exe_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("app.exe")
+        .to_string();
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("下载失败：{e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("下载失败：HTTP {}", resp.status()));
+    }
+    let total = resp.content_length().unwrap_or(0);
+    let mut file = fs::File::create(&new_exe).map_err(|e| format!("写入文件失败：{e}"))?;
+    let mut stream = resp.bytes_stream();
+    let mut done: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("下载中断：{e}"))?;
+        file.write_all(&chunk)
+            .map_err(|e| format!("写入文件失败：{e}"))?;
+        done += chunk.len() as u64;
+        if total > 0 {
+            let pct = (done as f64 / total as f64).clamp(0.0, 1.0);
+            let _ = app.emit("shell-download-progress", pct);
+        }
+    }
+    file.flush().map_err(|e| format!("写入文件失败：{e}"))?;
+
+    // 3. 生成延迟替换脚本
+    let bat = dir.join("update_shell.bat");
+    let script = format!(
+        "@echo off\r\n\
+         timeout /t 2 /nobreak >nul\r\n\
+         taskkill /f /im {name} >nul 2>&1\r\n\
+         del /f \"%~dp0{name}\" >nul 2>&1\r\n\
+         ren \"%~dp0app_new.exe\" \"{name}\"\r\n\
+         start \"\" \"%~dp0{name}\"\r\n\
+         del /f \"%~dp0update_shell.bat\" >nul 2>&1\r\n",
+        name = exe_name
+    );
+    fs::write(&bat, script).map_err(|e| format!("写入更新脚本失败：{e}"))?;
+
+    // 4. 无窗口启动脚本
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("cmd")
+            .args(["/c", bat.to_str().unwrap_or("")])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("启动更新脚本失败：{e}"))?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("sh").arg(&bat).spawn();
+    }
+
+    let _ = app.emit("shell-download-progress", 1.0);
+    Ok("更新完成，外壳即将重启".into())
+}
+
+/// 检查内核是否有新版本：比较 version.txt 记录与 core_version.json。
+/// version.txt 缺失（旧内核无记录）时返回 available=false（不打扰）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KernelUpdateInfo {
+    available: bool,
+    current: String,
+    latest: String,
+}
+
+#[tauri::command]
+async fn check_kernel_update() -> KernelUpdateInfo {
+    let current = fs::read_to_string(kernel_version_file())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if current.is_empty() || current == "unknown" {
+        return KernelUpdateInfo {
+            available: false,
+            current,
+            latest: String::new(),
+        };
+    }
+    match fetch_core_version().await {
+        Ok(latest) => KernelUpdateInfo {
+            available: latest != current,
+            current,
+            latest,
+        },
+        Err(_) => KernelUpdateInfo {
+            available: false,
+            current,
+            latest: String::new(),
+        },
+    }
+}
+
 /// 隧道状态文件路径
 fn status_file() -> PathBuf {
     kernel_dir().join("tunnel.ini")
@@ -51,16 +296,16 @@ async fn download_kernel(app: tauri::AppHandle) -> Result<String, String> {
         format!("/api/download/{platform}?arch={arch}")
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+    // 获取签名下载地址（主站 → 镜像）：短超时，避免网络不通时长时间无反馈
+    let meta_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
         .build()
         .map_err(|e| format!("HTTP 客户端初始化失败：{e}"))?;
-
     let mut last_err = String::new();
     let mut download_url = None;
     for base in ["https://hongshi.site", "https://shithub.site"] {
         let url = format!("{base}{api_path}");
-        match client.get(&url).send().await {
+        match meta_client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 match resp.json::<serde_json::Value>().await {
                     Ok(json) => {
@@ -84,13 +329,17 @@ async fn download_kernel(app: tauri::AppHandle) -> Result<String, String> {
     }
     let url = download_url.ok_or_else(|| format!("获取下载地址失败（{last_err}）"))?;
 
-    // 2. 流式下载到临时文件，原子改名
+    // 2. 流式下载到临时文件，原子改名（下载用长超时，避免慢网中断）
     let dir = kernel_dir();
     fs::create_dir_all(&dir).map_err(|e| format!("创建内核目录失败：{e}"))?;
     let tmp = dir.join("hongshi.exe.download");
     let target = kernel_exe();
 
-    let resp = client
+    let dl_client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("HTTP 客户端初始化失败：{e}"))?;
+    let resp = dl_client
         .get(&url)
         .send()
         .await
@@ -113,9 +362,17 @@ async fn download_kernel(app: tauri::AppHandle) -> Result<String, String> {
         }
     }
     file.flush().map_err(|e| format!("写入文件失败：{e}"))?;
+    // Windows 上 rename 无法覆盖已存在文件：先删旧内核
+    if target.exists() {
+        fs::remove_file(&target).map_err(|e| format!("删除旧内核失败：{e}"))?;
+    }
     fs::rename(&tmp, &target).map_err(|e| format!("保存内核失败：{e}"))?;
+    // 记录当前内核版本（请求 core_version.json，主站→镜像），供后续更新比对
     let _ = app.emit("kernel-download-progress", 1.0);
-    Ok("内核下载完成".into())
+    let ver = fetch_core_version().await;
+    let ver = ver.unwrap_or_else(|_| "unknown".to_string());
+    let _ = fs::write(dir.join("version.txt"), &ver);
+    Ok(format!("内核下载完成（版本 {ver}）"))
 }
 
 /// 启动内核：hongshi.exe -server <中转服务器> -port <本地MC端口> -status-file <路径>
@@ -326,11 +583,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             check_kernel,
             download_kernel,
+            check_kernel_update,
             start_kernel,
             stop_kernel,
             kernel_status,
             kernel_log,
-            open_kernel_log
+            open_kernel_log,
+            check_shell_update,
+            download_shell
         ])
         .setup(|app| {
             // 低分辨率屏幕自适应：
